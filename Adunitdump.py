@@ -1,7 +1,11 @@
-import os, sys, tempfile, subprocess, json, smtplib
+import os, sys, tempfile, subprocess, json, smtplib, io, csv
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart # Added for HTML support
 from prefect import flow, task
 from prefect.blocks.system import Secret
+from datetime import datetime
+from email.mime.base import MIMEBase
+from email import encoders
 
 def install_dependencies():
     try:
@@ -9,6 +13,7 @@ def install_dependencies():
         from googleads import ad_manager
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "gspread", "googleads"])
+
 @task(retries=2)
 def fetch_gam_data(cfg):
     from googleads import ad_manager 
@@ -40,23 +45,16 @@ def fetch_gam_data(cfg):
                 p_names.append(info['name']); p_ids.append(str(curr))
                 curr = info['parentId']
             p_names.reverse(); p_ids.reverse()
-            
             if len(p_ids) != cfg['depth']: continue
             if cfg['target_ids'] and not any(str(pid) in p_ids for pid in cfg['target_ids']): continue
-            
             sn, si = p_names[cfg['skip_levels']:], p_ids[cfg['skip_levels']:]
-            
-            # Returning all 10 columns to match your original sheet structure
             processed.append({
-                'Source': cfg['label'],
-                'Ad unit 1': sn[0] if len(sn) > 0 else "",
-                'Ad unit 2': sn[1] if len(sn) > 1 else "",
-                'Ad unit 3': sn[2] if len(sn) > 2 else "",
-                'Final Ad unit': sn[-1] if len(sn) > 0 else "",
-                'Ad unit 1 ID': si[0] if len(si) > 0 else "",
-                'Ad unit 2 ID': si[1] if len(si) > 1 else "",
-                'Ad unit 3 ID': si[2] if len(si) > 2 else "",
-                'Final Ad unit ID': si[-1] if len(si) > 0 else "",
+                'Source': cfg['label'], 'Ad unit 1': sn[0] if sn else "", 
+                'Ad unit 2': sn[1] if len(sn) > 1 else "", 'Ad unit 3': sn[2] if len(sn) > 2 else "",
+                'Final Ad unit': sn[-1] if sn else "", 
+                'Ad unit 1 ID': si[0] if si else "", 'Ad unit 2 ID': si[1] if len(si) > 1 else "", 
+                'Ad unit 3 ID': si[2] if len(si) > 2 else "", 
+                'Final Ad unit ID': si[-1] if si else "", 
                 'Status': u.status
             })
         return processed
@@ -74,46 +72,80 @@ def sync_to_sheets(new_data, sheet_name):
         gc = gspread.service_account(filename=tmp_path)
         sh = gc.open(sheet_name); ws = sh.get_worksheet(0)
         
-        print("Fetching existing IDs from Column I (index 9)...")
-        # Column I is index 9
-        raw_ids = ws.col_values(9) 
+        raw_ids = ws.col_values(9) # ID is in Column I
         existing_ids = {str(val).strip() for val in raw_ids if val}
 
         to_append = [u for u in new_data if str(u['Final Ad unit ID']).strip() not in existing_ids]
-        
         if to_append:
-            print(f"Found {len(to_append)} new units. Appending...")
-            # Headers sequence: Source(A), AU1(B), AU2(C), AU3(D), FinalAU(E), AU1ID(F), AU2ID(G), AU3ID(H), FinalAUID(I), Status(J)
             rows = [[
                 u['Source'], u['Ad unit 1'], u['Ad unit 2'], u['Ad unit 3'], u['Final Ad unit'],
                 u['Ad unit 1 ID'], u['Ad unit 2 ID'], u['Ad unit 3 ID'], u['Final Ad unit ID'], u['Status']
             ] for u in to_append]
-            
             ws.append_rows(rows, value_input_option='USER_ENTERED')
             return to_append
-        
-        print("No new units found. Sync complete.")
         return []
     finally:
         if os.path.exists(tmp_path): os.remove(tmp_path)
+
 @task
 def send_email(new_units):
     if not new_units: return
-    sender = "ritik.jain@timesinternet.in" # MUST MATCH APP PASSWORD ACCOUNT
-    pwd = Secret.load("gmaillogin").get()
-    recipient = "colombia.pubops@timesinternet.in"
     
-    body = "New Ad Units:\n\n" + "\n".join([f"- {u['Final Ad unit']} ({u['Source']})" for u in new_units])
-    msg = MIMEText(body)
-    msg['Subject'] = f"ALERT: {len(new_units)} New Ad Units"
-    msg['From'] = sender; msg['To'] = recipient
+    sender = "ritik.jain@timesinternet.in" 
+    pwd = Secret.load("gmail-app-password").get()
+    
+    to_recipient = "colombia.pubops@timesinternet.in"
+    cc_recipient = "ritik.jain@timesinternet.in" 
+    
+    # 1. Generate the dynamic filename
+    # format: 7th May 2026
+    now = datetime.now()
+    day = now.day
+    # Adding ordinal suffix (st, nd, rd, th)
+    suffix = 'th' if 11 <= day <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th')
+    date_str = now.strftime(f"{day}{suffix} %B %Y")
+    filename = f"New Ad units As on {date_str}.csv"
+
+    # 2. Create the CSV in memory
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["Source", "Final Ad unit", "Final Ad unit ID"])
+    writer.writeheader()
+    # We only include the columns you asked for in the CSV
+    for u in new_units:
+        writer.writerow({
+            "Source": u["Source"],
+            "Final Ad unit": u["Final Ad unit"],
+            "Final Ad unit ID": u["Final Ad unit ID"]
+        })
+    csv_content = output.getvalue()
+    output.close()
+
+    # 3. Build the Email
+    msg = MIMEMultipart()
+    msg['Subject'] = f"Automated ALERT: New Ad Units Detected - {date_str}"
+    msg['From'] = sender
+    msg['To'] = to_recipient
+    msg['Cc'] = cc_recipient
+    
+    body = f"Hi Team,\n\nPlease find the attached CSV for the new ad units detected on {date_str}.\n\nAutomated by Prefect."
+    msg.attach(MIMEText(body, 'plain'))
+
+    # 4. Attach the CSV
+    part = MIMEBase('application', 'octet-stream')
+    part.set_payload(csv_content.encode('utf-8'))
+    encoders.encode_base64(part)
+    part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+    msg.attach(part)
+
+    all_recipients = [to_recipient, cc_recipient]
 
     try:
         with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=30) as server:
-            server.login(sender, pwd) # Error 535 happens here
-            server.sendmail(sender, recipient, msg.as_string())
-        print("Email Sent!")
-    except Exception as e: print(f"Email Failed: {e}")
+            server.login(sender, pwd)
+            server.sendmail(sender, all_recipients, msg.as_string())
+        print(f"CSV Email Sent: {filename}")
+    except Exception as e: 
+        print(f"Email Failed: {e}")
 
 @flow(log_prints=True)
 def run_ad_unit_dump():

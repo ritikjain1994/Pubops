@@ -1,23 +1,30 @@
 import os
 import sys
 import tempfile
+import subprocess
 from prefect import flow, task
 from prefect.blocks.system import Secret
 
-# --- SYSTEM STABILIZATION ---
-os.environ['PYTHONUTF8'] = '1'
+# --- BOOTSTRAP: THIS INSTALLS THE LIBRARIES IN THE CLOUD ---
+def install_dependencies():
+    try:
+        import gspread
+        from googleads import ad_manager
+        print("Required libraries are already installed.")
+    except ImportError:
+        print("Installing gspread and googleads in the cloud environment...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "gspread", "googleads"])
 
 # --- TASK 1: FETCH DATA FROM GAM ---
 @task(retries=2, retry_delay_seconds=60)
 def fetch_and_process(cfg):
-    # Delayed import to allow Prefect to install the library first
+    # Delayed import so the script doesn't crash before installing
     from googleads import ad_manager 
 
-    # 1. Pull the JSON key from your Prefect Secret Blocks
+    # Pulling from your specific block names
     secret_name = "oldgamkey" if cfg['label'] == 'OLD GAM' else "newgamkey"
-    json_key_data = Secret.load(secret_name).get() #
+    json_key_data = Secret.load(secret_name).get() 
 
-    # 2. Create a temporary file because the googleads library requires a physical file path
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
         tmp.write(json_key_data)
         tmp_key_path = tmp.name
@@ -35,7 +42,6 @@ ad_manager:
         all_units_raw = []
         page_limit = 1000
         current_offset = 0
-
         print(f">>> Processing {cfg['label']}...")
 
         while True:
@@ -44,7 +50,6 @@ ad_manager:
             query_str = f"{where_clause} ORDER BY id ASC LIMIT {page_limit} OFFSET {current_offset}".strip()
 
             response = inventory_service.getAdUnitsByStatement({'query': query_str})
-
             if 'results' in response and len(response['results']) > 0:
                 all_units_raw.extend(response['results'])
                 current_offset += page_limit
@@ -92,10 +97,7 @@ ad_manager:
 # --- TASK 2: UPLOAD TO GOOGLE SHEETS ---
 @task
 def upload_to_sheets(data, sheet_name):
-    # Delayed import to allow Prefect to install the library first
     import gspread 
-    
-    # We use the New GAM key because it already has access to the Sheet
     auth_json = Secret.load("newgamkey").get()
     
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
@@ -119,11 +121,11 @@ def upload_to_sheets(data, sheet_name):
             os.remove(tmp_path)
 
 # --- THE MAIN FLOW ---
-@flow(
-    log_prints=True, 
-    pip_packages=["googleads", "gspread", "prefect>=3.0.0"] #
-)
+@flow(log_prints=True)
 def run_ad_unit_dump():
+    # Install dependencies on the cloud machine before doing anything else
+    install_dependencies()
+
     configs = [
         {
             'label': 'OLD GAM', 'network_code': '7176', 'status_filter': 'ACTIVE',
@@ -144,7 +146,6 @@ def run_ad_unit_dump():
             print(f"!! Failed on {cfg['label']}: {e}")
 
     if final_output:
-        # ENSURE THIS matches your Google Sheet name exactly
         upload_to_sheets(final_output, "Pubops_Ad_Units")
 
 if __name__ == "__main__":

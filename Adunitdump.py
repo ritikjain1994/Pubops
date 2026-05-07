@@ -9,7 +9,6 @@ def install_dependencies():
         from googleads import ad_manager
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "gspread", "googleads"])
-
 @task(retries=2)
 def fetch_gam_data(cfg):
     from googleads import ad_manager 
@@ -41,12 +40,23 @@ def fetch_gam_data(cfg):
                 p_names.append(info['name']); p_ids.append(str(curr))
                 curr = info['parentId']
             p_names.reverse(); p_ids.reverse()
+            
             if len(p_ids) != cfg['depth']: continue
             if cfg['target_ids'] and not any(str(pid) in p_ids for pid in cfg['target_ids']): continue
+            
             sn, si = p_names[cfg['skip_levels']:], p_ids[cfg['skip_levels']:]
+            
+            # Returning all 10 columns to match your original sheet structure
             processed.append({
-                'Source': cfg['label'], 'Ad unit 1': sn[0] if sn else "", 
-                'Final Ad unit': sn[-1] if sn else "", 'Final Ad unit ID': si[-1] if si else "", 
+                'Source': cfg['label'],
+                'Ad unit 1': sn[0] if len(sn) > 0 else "",
+                'Ad unit 2': sn[1] if len(sn) > 1 else "",
+                'Ad unit 3': sn[2] if len(sn) > 2 else "",
+                'Final Ad unit': sn[-1] if len(sn) > 0 else "",
+                'Ad unit 1 ID': si[0] if len(si) > 0 else "",
+                'Ad unit 2 ID': si[1] if len(si) > 1 else "",
+                'Ad unit 3 ID': si[2] if len(si) > 2 else "",
+                'Final Ad unit ID': si[-1] if len(si) > 0 else "",
                 'Status': u.status
             })
         return processed
@@ -64,25 +74,28 @@ def sync_to_sheets(new_data, sheet_name):
         gc = gspread.service_account(filename=tmp_path)
         sh = gc.open(sheet_name); ws = sh.get_worksheet(0)
         
-        # Robust ID Fetching
-        all_vals = ws.get_all_values()
-        if not all_vals: # If sheet is totally empty, add headers
-            headers = ['Source', 'Ad unit 1', 'Final Ad unit', 'Final Ad unit ID', 'Status']
-            ws.append_row(headers)
-            existing_ids = set()
-        else:
-            # Assume ID is in the 4th column (index 3)
-            existing_ids = {str(row[3]) for row in all_vals if len(row) > 3}
+        print("Fetching existing IDs from Column I (index 9)...")
+        # Column I is index 9
+        raw_ids = ws.col_values(9) 
+        existing_ids = {str(val).strip() for val in raw_ids if val}
 
-        to_append = [u for u in new_data if str(u['Final Ad unit ID']) not in existing_ids]
+        to_append = [u for u in new_data if str(u['Final Ad unit ID']).strip() not in existing_ids]
+        
         if to_append:
-            rows = [['OLD GAM' if u['Source']=='OLD GAM' else 'New GAM', u['Ad unit 1'], u['Final Ad unit'], u['Final Ad unit ID'], u['Status']] for u in to_append]
+            print(f"Found {len(to_append)} new units. Appending...")
+            # Headers sequence: Source(A), AU1(B), AU2(C), AU3(D), FinalAU(E), AU1ID(F), AU2ID(G), AU3ID(H), FinalAUID(I), Status(J)
+            rows = [[
+                u['Source'], u['Ad unit 1'], u['Ad unit 2'], u['Ad unit 3'], u['Final Ad unit'],
+                u['Ad unit 1 ID'], u['Ad unit 2 ID'], u['Ad unit 3 ID'], u['Final Ad unit ID'], u['Status']
+            ] for u in to_append]
+            
             ws.append_rows(rows, value_input_option='USER_ENTERED')
             return to_append
+        
+        print("No new units found. Sync complete.")
         return []
     finally:
         if os.path.exists(tmp_path): os.remove(tmp_path)
-
 @task
 def send_email(new_units):
     if not new_units: return

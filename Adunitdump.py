@@ -1,146 +1,107 @@
-import os
-import sys
-import tempfile
-import subprocess
-import json
-import smtplib
+import os, sys, tempfile, subprocess, json, smtplib
 from email.mime.text import MIMEText
 from prefect import flow, task
 from prefect.blocks.system import Secret
 
-# --- BOOTSTRAP: INSTALL LIBRARIES ---
 def install_dependencies():
     try:
         import gspread
         from googleads import ad_manager
     except ImportError:
-        print("Installing libraries in cloud environment...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "gspread", "googleads"])
 
-# --- TASK 1: FETCH DATA FROM GAM ---
-@task(retries=2, retry_delay_seconds=60)
+@task(retries=2)
 def fetch_gam_data(cfg):
     from googleads import ad_manager 
-    secret_name = "oldgamkey" if cfg['label'] == 'OLD GAM' else "newgamkey"
-    json_key_data = Secret.load(secret_name).get() 
+    json_key = Secret.load("oldgamkey" if cfg['label'] == 'OLD GAM' else "newgamkey").get()
+    if isinstance(json_key, dict): json_key = json.dumps(json_key)
 
-    if isinstance(json_key_data, dict):
-        json_key_data = json.dumps(json_key_data)
-
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp:
-        tmp.write(json_key_data)
-        tmp_key_path = tmp.name
-
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
+        tmp.write(json_key); tmp_path = tmp.name
     try:
-        yaml_config = f"ad_manager:\n  application_name: 'GAM_Dump'\n  network_code: '{cfg['network_code']}'\n  path_to_private_key_file: '{tmp_key_path}'"
-        client = ad_manager.AdManagerClient.LoadFromString(yaml_config)
-        inventory_service = client.GetService('InventoryService', version='v202602')
-
-        all_units_raw, current_offset = [], 0
+        yaml = f"ad_manager:\n  application_name: 'GAM_Dump'\n  network_code: '{cfg['network_code']}'\n  path_to_private_key_file: '{tmp_path}'"
+        client = ad_manager.AdManagerClient.LoadFromString(yaml)
+        service = client.GetService('InventoryService', version='v202602')
+        all_units, offset = [], 0
         while True:
-            query = f"WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT 1000 OFFSET {current_offset}" if cfg['status_filter'] else f"ORDER BY id ASC LIMIT 1000 OFFSET {current_offset}"
-            response = inventory_service.getAdUnitsByStatement({'query': query})
-            if 'results' in response and len(response['results']) > 0:
-                all_units_raw.extend(response['results'])
-                current_offset += 1000
+            query = f"WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT 1000 OFFSET {offset}" if cfg['status_filter'] else f"ORDER BY id ASC LIMIT 1000 OFFSET {offset}"
+            res = service.getAdUnitsByStatement({'query': query})
+            if 'results' in res:
+                all_units.extend(res['results']); offset += 1000
+                if len(res['results']) < 1000: break
             else: break
-
-        unit_map = {u.id: {'name': u.name, 'parentId': getattr(u, 'parentId', None)} for u in all_units_raw}
+        
+        unit_map = {u.id: {'name': u.name, 'parentId': getattr(u, 'parentId', None)} for u in all_units}
         processed = []
-        for unit in all_units_raw:
-            path_names, path_ids, curr_id = [], [], unit.id
-            while curr_id:
-                curr_info = unit_map.get(curr_id)
-                if not curr_info: break
-                path_names.append(curr_info['name']); path_ids.append(str(curr_id))
-                curr_id = curr_info['parentId']
-            path_names.reverse(); path_ids.reverse()
-
-            if len(path_ids) != cfg['depth']: continue
-            if cfg['target_ids'] and not any(str(pid) in path_ids for pid in cfg['target_ids']): continue
-
-            shifted_n = path_names[cfg['skip_levels']:]; shifted_i = path_ids[cfg['skip_levels']:]
+        for u in all_units:
+            p_names, p_ids, curr = [], [], u.id
+            while curr:
+                info = unit_map.get(curr)
+                if not info: break
+                p_names.append(info['name']); p_ids.append(str(curr))
+                curr = info['parentId']
+            p_names.reverse(); p_ids.reverse()
+            if len(p_ids) != cfg['depth']: continue
+            if cfg['target_ids'] and not any(str(pid) in p_ids for pid in cfg['target_ids']): continue
+            sn, si = p_names[cfg['skip_levels']:], p_ids[cfg['skip_levels']:]
             processed.append({
-                'Source': cfg['label'], 'Ad unit 1': shifted_n[0] if shifted_n else "", 
-                'Final Ad unit': shifted_n[-1] if shifted_n else "",
-                'Final Ad unit ID': shifted_i[-1] if shifted_i else "", 'Status': unit.status
+                'Source': cfg['label'], 'Ad unit 1': sn[0] if sn else "", 
+                'Final Ad unit': sn[-1] if sn else "", 'Final Ad unit ID': si[-1] if si else "", 
+                'Status': u.status
             })
         return processed
     finally:
-        if os.path.exists(tmp_key_path): os.remove(tmp_key_path)
+        if os.path.exists(tmp_path): os.remove(tmp_path)
 
-# --- TASK 2: GET EXISTING IDS & APPEND NEW ONES ---
-# --- UPDATED TASK 2: SPEEDY SYNC ---
 @task
 def sync_to_sheets(new_data, sheet_name):
     import gspread 
-    print(f"Connecting to Google Sheets: {sheet_name}...")
-    auth_json = Secret.load("newgamkey").get()
-    if isinstance(auth_json, dict): auth_json = json.dumps(auth_json)
-
+    auth = Secret.load("newgamkey").get()
+    if isinstance(auth, dict): auth = json.dumps(auth)
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
-        tmp.write(auth_json); tmp_path = tmp.name
-    
+        tmp.write(auth); tmp_path = tmp.name
     try:
         gc = gspread.service_account(filename=tmp_path)
-        sh = gc.open(sheet_name)
-        worksheet = sh.get_worksheet(0)
+        sh = gc.open(sheet_name); ws = sh.get_worksheet(0)
         
-        print("Reading existing IDs from sheet (Column D)...")
-        # Optimization: Only get the ID column (Assuming ID is Column D/4)
-        existing_ids = set(worksheet.col_values(4)) 
-        
-        print(f"Found {len(existing_ids)} existing units. Filtering new data...")
-        to_append = [u for u in new_data if str(u['Final Ad unit ID']) not in existing_ids]
-        
-        if to_append:
-            print(f"Appending {len(to_append)} new rows...")
+        # Robust ID Fetching
+        all_vals = ws.get_all_values()
+        if not all_vals: # If sheet is totally empty, add headers
             headers = ['Source', 'Ad unit 1', 'Final Ad unit', 'Final Ad unit ID', 'Status']
-            rows_to_add = [[u[h] for h in headers] for u in to_append]
-            worksheet.append_rows(rows_to_add)
+            ws.append_row(headers)
+            existing_ids = set()
+        else:
+            # Assume ID is in the 4th column (index 3)
+            existing_ids = {str(row[3]) for row in all_vals if len(row) > 3}
+
+        to_append = [u for u in new_data if str(u['Final Ad unit ID']) not in existing_ids]
+        if to_append:
+            rows = [['OLD GAM' if u['Source']=='OLD GAM' else 'New GAM', u['Ad unit 1'], u['Final Ad unit'], u['Final Ad unit ID'], u['Status']] for u in to_append]
+            ws.append_rows(rows, value_input_option='USER_ENTERED')
             return to_append
-        
-        print("No new units found.")
         return []
-    except Exception as e:
-        print(f"Error in Sync: {e}")
-        raise e
     finally:
         if os.path.exists(tmp_path): os.remove(tmp_path)
 
-# --- UPDATED TASK 3: SMTP WITH TIMEOUT ---
 @task
 def send_email(new_units):
     if not new_units: return
-    
-    print("Preparing to send email alert...")
-    sender_email = "your-gmail@gmail.com" 
-    app_password = Secret.load("gmail-app-password").get()
+    sender = "ritik.jain@timesinternet.in" # MUST MATCH APP PASSWORD ACCOUNT
+    pwd = Secret.load("gmaillogin").get()
     recipient = "colombia.pubops@timesinternet.in"
     
-    unit_list = "\n".join([f"- {u['Final Ad unit']} ({u['Source']})" for u in new_units])
-    body = f"New Ad Units Detected:\n\n{unit_list}"
-    
+    body = "New Ad Units:\n\n" + "\n".join([f"- {u['Final Ad unit']} ({u['Source']})" for u in new_units])
     msg = MIMEText(body)
-    msg['Subject'] = f"GAM ALERT: {len(new_units)} New Units"
-    msg['From'] = sender_email
-    msg['To'] = recipient
+    msg['Subject'] = f"ALERT: {len(new_units)} New Ad Units"
+    msg['From'] = sender; msg['To'] = recipient
 
     try:
-        print("Connecting to Gmail SMTP (Port 465)...")
-        # Added a 30-second timeout so it doesn't hang forever
         with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=30) as server:
-            print("Logging in...")
-            server.login(sender_email, app_password)
-            print("Sending...")
-            server.sendmail(sender_email, recipient, msg.as_string())
-        print("Email sent!")
-    except Exception as e:
-        print(f"Email failed: {e}")
-        # We don't want the whole flow to fail just because the email failed
+            server.login(sender, pwd) # Error 535 happens here
+            server.sendmail(sender, recipient, msg.as_string())
+        print("Email Sent!")
+    except Exception as e: print(f"Email Failed: {e}")
 
-        
-# --- MAIN FLOW ---
 @flow(log_prints=True)
 def run_ad_unit_dump():
     install_dependencies()
@@ -148,15 +109,13 @@ def run_ad_unit_dump():
         {'label': 'OLD GAM', 'network_code': '7176', 'status_filter': 'ACTIVE', 'target_ids': [23325198618, 23326563038], 'depth': 5, 'skip_levels': 1},
         {'label': 'New GAM', 'network_code': '23037861279', 'status_filter': None, 'target_ids': None, 'depth': 6, 'skip_levels': 2}
     ]
-    
-    all_current_data = []
+    all_data = []
     for cfg in configs:
         data = fetch_gam_data(cfg)
-        all_current_data.extend(data)
-
-    added_units = sync_to_sheets(all_current_data, "Pubops_Ad_Units")
-    if added_units:
-        send_email(added_units)
+        all_data.extend(data)
+    
+    added = sync_to_sheets(all_data, "Pubops_Ad_Units")
+    if added: send_email(added)
 
 if __name__ == "__main__":
     run_ad_unit_dump()

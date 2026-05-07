@@ -70,9 +70,11 @@ def fetch_gam_data(cfg):
         if os.path.exists(tmp_key_path): os.remove(tmp_key_path)
 
 # --- TASK 2: GET EXISTING IDS & APPEND NEW ONES ---
+# --- UPDATED TASK 2: SPEEDY SYNC ---
 @task
 def sync_to_sheets(new_data, sheet_name):
     import gspread 
+    print(f"Connecting to Google Sheets: {sheet_name}...")
     auth_json = Secret.load("newgamkey").get()
     if isinstance(auth_json, dict): auth_json = json.dumps(auth_json)
 
@@ -84,45 +86,60 @@ def sync_to_sheets(new_data, sheet_name):
         sh = gc.open(sheet_name)
         worksheet = sh.get_worksheet(0)
         
-        # 1. Get existing IDs to avoid duplicates
-        existing_rows = worksheet.get_all_records()
-        existing_ids = {str(row['Final Ad unit ID']) for row in existing_rows}
+        print("Reading existing IDs from sheet (Column D)...")
+        # Optimization: Only get the ID column (Assuming ID is Column D/4)
+        existing_ids = set(worksheet.col_values(4)) 
         
-        # 2. Filter for truly NEW units
+        print(f"Found {len(existing_ids)} existing units. Filtering new data...")
         to_append = [u for u in new_data if str(u['Final Ad unit ID']) not in existing_ids]
         
         if to_append:
+            print(f"Appending {len(to_append)} new rows...")
             headers = ['Source', 'Ad unit 1', 'Final Ad unit', 'Final Ad unit ID', 'Status']
             rows_to_add = [[u[h] for h in headers] for u in to_append]
             worksheet.append_rows(rows_to_add)
-            print(f"Added {len(to_append)} new units.")
             return to_append
+        
+        print("No new units found.")
         return []
+    except Exception as e:
+        print(f"Error in Sync: {e}")
+        raise e
     finally:
         if os.path.exists(tmp_path): os.remove(tmp_path)
 
-# --- TASK 3: SEND EMAIL NOTIFICATION ---
+# --- UPDATED TASK 3: SMTP WITH TIMEOUT ---
 @task
 def send_email(new_units):
     if not new_units: return
     
-    sender_email = "ritik.jain@timesinternet.in"  # Replace with your Gmail
+    print("Preparing to send email alert...")
+    sender_email = "your-gmail@gmail.com" 
     app_password = Secret.load("gmail-app-password").get()
     recipient = "colombia.pubops@timesinternet.in"
     
     unit_list = "\n".join([f"- {u['Final Ad unit']} ({u['Source']})" for u in new_units])
-    body = f"Hello,\n\nNew Ad Units have been detected and added to the sheet:\n\n{unit_list}\n\nAutomated by Prefect."
+    body = f"New Ad Units Detected:\n\n{unit_list}"
     
     msg = MIMEText(body)
-    msg['Subject'] = f"Automated : ALERT: {len(new_units)} New Ad Units Created"
+    msg['Subject'] = f"GAM ALERT: {len(new_units)} New Units"
     msg['From'] = sender_email
     msg['To'] = recipient
 
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-        server.login(sender_email, app_password)
-        server.sendmail(sender_email, recipient, msg.as_string())
-    print("Email sent successfully.")
+    try:
+        print("Connecting to Gmail SMTP (Port 465)...")
+        # Added a 30-second timeout so it doesn't hang forever
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=30) as server:
+            print("Logging in...")
+            server.login(sender_email, app_password)
+            print("Sending...")
+            server.sendmail(sender_email, recipient, msg.as_string())
+        print("Email sent!")
+    except Exception as e:
+        print(f"Email failed: {e}")
+        # We don't want the whole flow to fail just because the email failed
 
+        
 # --- MAIN FLOW ---
 @flow(log_prints=True)
 def run_ad_unit_dump():

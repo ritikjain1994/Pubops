@@ -1,0 +1,4 @@
+prefect>=3.0.0
+google-ads
+pandas
+gspread

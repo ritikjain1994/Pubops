@@ -1,21 +1,21 @@
 import os
-import csv
 import sys
 import tempfile
-import gspread
 from prefect import flow, task
 from prefect.blocks.system import Secret
-from googleads import ad_manager
 
 # --- SYSTEM STABILIZATION ---
 os.environ['PYTHONUTF8'] = '1'
 
-# --- TASK 1: THE CORE GOOGLE ADS LOGIC ---
+# --- TASK 1: FETCH DATA FROM GAM ---
 @task(retries=2, retry_delay_seconds=60)
 def fetch_and_process(cfg):
-    # 1. Pull the JSON key from Prefect Secret Blocks
+    # Delayed import to allow Prefect to install the library first
+    from googleads import ad_manager 
+
+    # 1. Pull the JSON key from your Prefect Secret Blocks
     secret_name = "oldgamkey" if cfg['label'] == 'OLD GAM' else "newgamkey"
-    json_key_data = Secret.load(secret_name).get()
+    json_key_data = Secret.load(secret_name).get() #
 
     # 2. Create a temporary file because the googleads library requires a physical file path
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
@@ -86,12 +86,16 @@ ad_manager:
             })
         return processed_data
     finally:
-        os.remove(tmp_key_path) # Clean up the temp file
+        if os.path.exists(tmp_key_path):
+            os.remove(tmp_key_path)
 
 # --- TASK 2: UPLOAD TO GOOGLE SHEETS ---
 @task
 def upload_to_sheets(data, sheet_name):
-    # Pull the same JSON key used for New GAM (assuming it has access to Sheets)
+    # Delayed import to allow Prefect to install the library first
+    import gspread 
+    
+    # We use the New GAM key because it already has access to the Sheet
     auth_json = Secret.load("newgamkey").get()
     
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
@@ -111,10 +115,14 @@ def upload_to_sheets(data, sheet_name):
         worksheet.update('A1', [headers] + rows)
         print(f"Successfully updated Google Sheet: {sheet_name}")
     finally:
-        os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 # --- THE MAIN FLOW ---
-@flow(log_prints=True, pip_packages=["gspread", "googleads", "prefect>=3.0.0", "pandas"])
+@flow(
+    log_prints=True, 
+    pip_packages=["googleads", "gspread", "prefect>=3.0.0"] #
+)
 def run_ad_unit_dump():
     configs = [
         {
@@ -136,7 +144,7 @@ def run_ad_unit_dump():
             print(f"!! Failed on {cfg['label']}: {e}")
 
     if final_output:
-        # CHANGE THIS to your actual Google Sheet name
+        # ENSURE THIS matches your Google Sheet name exactly
         upload_to_sheets(final_output, "Pubops_Ad_Units")
 
 if __name__ == "__main__":

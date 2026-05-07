@@ -114,7 +114,7 @@ def upload_to_sheets(data, sheet_name):
         os.remove(tmp_path)
 
 # --- THE MAIN FLOW ---
-@flow(log_prints=True)
+@flow(log_prints=True, pip_packages=["gspread", "googleads", "prefect>=3.0.0", "pandas"])
 def run_ad_unit_dump():
     configs = [
         {

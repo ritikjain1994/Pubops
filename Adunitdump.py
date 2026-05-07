@@ -2,30 +2,33 @@ import os
 import sys
 import tempfile
 import subprocess
+import json  # New import to handle the dictionary conversion
 from prefect import flow, task
 from prefect.blocks.system import Secret
 
-# --- BOOTSTRAP: THIS INSTALLS THE LIBRARIES IN THE CLOUD ---
+# --- BOOTSTRAP: INSTALL LIBRARIES ---
 def install_dependencies():
     try:
         import gspread
         from googleads import ad_manager
-        print("Required libraries are already installed.")
     except ImportError:
-        print("Installing gspread and googleads in the cloud environment...")
+        print("Installing libraries...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "gspread", "googleads"])
 
-# --- TASK 1: FETCH DATA FROM GAM ---
+# --- TASK 1: FETCH DATA ---
 @task(retries=2, retry_delay_seconds=60)
 def fetch_and_process(cfg):
-    # Delayed import so the script doesn't crash before installing
     from googleads import ad_manager 
 
-    # Pulling from your specific block names
+    # Pull the key from Prefect
     secret_name = "oldgamkey" if cfg['label'] == 'OLD GAM' else "newgamkey"
     json_key_data = Secret.load(secret_name).get() 
 
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
+    # FIX: If Prefect returns a dict, convert it to a string
+    if isinstance(json_key_data, dict):
+        json_key_data = json.dumps(json_key_data)
+
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp:
         tmp.write(json_key_data)
         tmp_key_path = tmp.name
 
@@ -42,7 +45,6 @@ ad_manager:
         all_units_raw = []
         page_limit = 1000
         current_offset = 0
-        print(f">>> Processing {cfg['label']}...")
 
         while True:
             query_parts = [f"status = '{cfg['status_filter']}'"] if cfg['status_filter'] else []
@@ -94,13 +96,17 @@ ad_manager:
         if os.path.exists(tmp_key_path):
             os.remove(tmp_key_path)
 
-# --- TASK 2: UPLOAD TO GOOGLE SHEETS ---
+# --- TASK 2: UPLOAD TO SHEETS ---
 @task
 def upload_to_sheets(data, sheet_name):
     import gspread 
     auth_json = Secret.load("newgamkey").get()
     
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
+    # FIX: Ensure this key is also converted if it's a dict
+    if isinstance(auth_json, dict):
+        auth_json = json.dumps(auth_json)
+
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json', encoding='utf-8') as tmp:
         tmp.write(auth_json)
         tmp_path = tmp.name
     
@@ -108,14 +114,11 @@ def upload_to_sheets(data, sheet_name):
         gc = gspread.service_account(filename=tmp_path)
         sh = gc.open(sheet_name)
         worksheet = sh.get_worksheet(0)
-        
         headers = ['Source', 'Ad unit 1', 'Ad unit 2', 'Ad unit 3', 'Final Ad unit',
                    'Ad unit 1 ID', 'Ad unit 2 ID', 'Ad unit 3 ID', 'Final Ad unit ID', 'Status']
-        
         rows = [[row[h] for h in headers] for row in data]
         worksheet.clear()
         worksheet.update('A1', [headers] + rows)
-        print(f"Successfully updated Google Sheet: {sheet_name}")
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -123,9 +126,7 @@ def upload_to_sheets(data, sheet_name):
 # --- THE MAIN FLOW ---
 @flow(log_prints=True)
 def run_ad_unit_dump():
-    # Install dependencies on the cloud machine before doing anything else
     install_dependencies()
-
     configs = [
         {
             'label': 'OLD GAM', 'network_code': '7176', 'status_filter': 'ACTIVE',
@@ -136,7 +137,6 @@ def run_ad_unit_dump():
             'target_ids': None, 'depth': 6, 'skip_levels': 2
         }
     ]
-
     final_output = []
     for cfg in configs:
         try:

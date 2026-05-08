@@ -94,15 +94,44 @@ def find_direct_order_gaps_by_id(all_gam_data, sheet_id):
         tmp.write(auth); tmp_path = tmp.name
     try:
         gc = gspread.service_account(filename=tmp_path)
-        sh = gc.open_by_key(sheet_id); ws = sh.get_worksheet(0)
+        sh = gc.open_by_key(sheet_id)
         
-        # Read Column H (Index 8)
-        direct_order_ids = {str(val).strip() for val in ws.col_values(8) if val}
+        # TARGET SPECIFIC TAB: "Ad_Unit_Mapping"
+        try:
+            ws = sh.worksheet("Ad_Unit_Mapping")
+        except gspread.exceptions.WorksheetNotFound:
+            print("ERROR: Could not find tab named 'Ad_Unit_Mapping'. Checking first tab instead.")
+            ws = sh.get_worksheet(0)
         
-        gaps = [u for u in all_gam_data if str(u['Final Ad unit ID']).strip() not in direct_order_ids]
+        print(f"Reading Column H from '{ws.title}' (ID: {sheet_id})...")
+        
+        # 1. Fetch raw values from Column H (8th column)
+        raw_values = ws.col_values(8)
+        
+        # 2. Aggressive Normalization
+        # Strips apostrophes, spaces, and handles nulls
+        direct_order_ids = set()
+        for val in raw_values:
+            if val:
+                # Remove leading ' and extra spaces
+                clean_val = str(val).strip().replace("'", "")
+                if clean_val:
+                    direct_order_ids.add(clean_val)
+        
+        print(f"DEBUG: Successfully indexed {len(direct_order_ids)} IDs from Ad_Unit_Mapping.")
+
+        # 3. Perform the Match
+        gaps = []
+        for u in all_gam_data:
+            gam_id = str(u['Final Ad unit ID']).strip().replace("'", "")
+            if gam_id not in direct_order_ids:
+                gaps.append(u)
+        
+        print(f"RESULT: {len(gaps)} units from GAM are NOT in Ad_Unit_Mapping.")
         return gaps
+
     except Exception as e:
-        print(f"Warning: Could not read Direct Order sheet: {e}")
+        print(f"CRITICAL ERROR in Gap Check: {e}")
         return []
     finally:
         if os.path.exists(tmp_path): os.remove(tmp_path)

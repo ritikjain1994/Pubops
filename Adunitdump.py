@@ -110,10 +110,10 @@ def find_direct_order_gaps_by_id(all_gam_data, sheet_id):
 # --- TASK 4: SEND MAILER (ALWAYS SENDS) ---
 @task
 def send_combined_email(added_to_master, direct_order_gaps):
-    sender = "YOUR_ACTUAL_GMAIL@gmail.com" 
-    pwd = Secret.load("gmail-app-password").get()
+    sender = "ritik.jain@timesinternet.in" 
+    pwd = Secret.load("gmaillogin").get()
     to_recip = "colombia.pubops@timesinternet.in"
-    cc_recip = "YOUR_ACTUAL_GMAIL@gmail.com" 
+    cc_recip = "ritik.jain@timesinternet.in" 
 
     now = datetime.now()
     d = now.day
